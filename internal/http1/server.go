@@ -2,173 +2,128 @@ package http1
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
+	"time"
+)
+
+const (
+	headerTimeout = 10 * time.Second
+	writeTimeout  = 30 * time.Second
+	idleTimeout   = 60 * time.Second
 )
 
 func ListenAndServe(addr string, handler http.Handler) error {
-	listener, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	defer listener.Close()
+	return Serve(ln, handler)
+}
 
+func Serve(ln net.Listener, handler http.Handler) error {
+	defer ln.Close()
 	if handler == nil {
 		handler = http.DefaultServeMux
 	}
-
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			return fmt.Errorf("accept: %w", err)
-		}
-
-		go HandleConnection(conn, handler)
-	}
-}
-
-func HandleConnection(conn net.Conn, mux http.Handler) error {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-
-	for {
-		req, err := ParseRequest(reader)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
+			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			var httpErr *HTTPError
-			if errors.As(err, &httpErr) {
-				writeError(conn, httpErr.StatusCode, httpErr.Message)
-			} else {
-				writeError(conn, http.StatusBadRequest, err.Error())
+			return fmt.Errorf("accept: %w", err)
+		}
+		go func() {
+			if err := HandleConnection(conn, handler); err != nil {
+				log.Printf("connection %s: %v", conn.RemoteAddr(), err)
 			}
-			return err
-		}
+		}()
+	}
+}
 
-		// Initialize Response from response.go
-		res := NewResponse(conn)
-		res.Proto = req.Proto
-		res.CloseConn = req.Close ||
-			strings.EqualFold(req.Header.Get("Connection"), "close") ||
-			(req.ProtoMajor == 1 && req.ProtoMinor == 0)
+// HandleConnection runs the request loop for one connection.
+func HandleConnection(conn net.Conn, mux http.Handler) error {
+	defer conn.Close()
+	br := bufio.NewReader(conn)
 
-		// Dispatch request to handler
-		mux.ServeHTTP(res, req)
+	for {
+		conn.SetReadDeadline(time.Now().Add(headerTimeout))
 
-		// RFC 9112 §6.3: If neither Content-Length nor Transfer-Encoding is set,
-		// close connection so the client knows the body is complete.
-		if res.Header().Get("Content-Length") == "" && res.Header().Get("Transfer-Encoding") == "" {
-			res.CloseConn = true
-		}
-
-		if err := res.Finish(); err != nil {
-			return err
-		}
-
-		if res.CloseConn {
+		req, perr := ParseRequest(br)
+		if perr != nil {
+			if errors.Is(perr, io.EOF) {
+				return nil // client closed cleanly between requests
+			}
+			writeError(conn, perr)
 			return nil
 		}
-	}
-}
 
-// writeError sends an RFC-compliant plaintext response directly over the socket.
-func writeError(conn net.Conn, statusCode int, message string) {
-	body := message + "\n"
-	resp := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		statusCode,
-		http.StatusText(statusCode),
-		len(body),
-		body,
-	)
-	_, _ = conn.Write([]byte(resp))
-}
+		req.RemoteAddr = conn.RemoteAddr().String()
+		ctx, cancel := context.WithCancel(context.Background())
+		req = req.WithContext(ctx)
 
-// ============================================================================
-// ResponseWriter Implementation (implements http.ResponseWriter)
-// ============================================================================
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 
-type responseWriter struct {
-	conn        net.Conn
-	bufWriter   *bufio.Writer
-	header      http.Header
-	wroteHeader bool
-	statusCode  int
-	proto       string
-	closeConn   bool
-}
+		w := NewResponse(conn)
+		w.req = req
+		w.closeAfter = req.Close
 
-func newResponseWriter(conn net.Conn, proto string, closeConn bool) *responseWriter {
-	return &responseWriter{
-		conn:      conn,
-		bufWriter: bufio.NewWriter(conn),
-		header:    make(http.Header),
-		proto:     proto,
-		closeConn: closeConn,
-	}
-}
+		serve(mux, w, req)
 
-func (w *responseWriter) Header() http.Header {
-	return w.header
-}
-
-func (w *responseWriter) WriteHeader(statusCode int) {
-	if w.wroteHeader {
-		return
-	}
-	w.statusCode = statusCode
-	w.flushHeader()
-}
-
-func (w *responseWriter) Write(p []byte) (int, error) {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
-	}
-	return w.bufWriter.Write(p)
-}
-
-func (w *responseWriter) flushHeader() {
-	if w.wroteHeader {
-		return
-	}
-	w.wroteHeader = true
-
-	if w.statusCode == 0 {
-		w.statusCode = http.StatusOK
-	}
-	if w.proto == "" {
-		w.proto = "HTTP/1.1"
-	}
-
-	statusText := http.StatusText(w.statusCode)
-	if statusText == "" {
-		statusText = "status code " + strconv.Itoa(w.statusCode)
-	}
-
-	// Format HTTP Status Line: HTTP/1.1 200 OK\r\n
-	fmt.Fprintf(w.bufWriter, "%s %d %s\r\n", w.proto, w.statusCode, statusText)
-
-	if w.closeConn {
-		w.header.Set("Connection", "close")
-	}
-
-	// Format Field Lines: Field-Name: Field-Value\r\n
-	for k, vals := range w.header {
-		for _, v := range vals {
-			fmt.Fprintf(w.bufWriter, "%s: %s\r\n", k, v)
+		if err := w.finish(); err != nil {
+			cancel()
+			return err
 		}
+		cancel()
+
+		if !drain(req.Body) {
+			return nil // unread body too large to drain: close
+		}
+		if w.closeAfter {
+			return nil
+		}
+		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	}
-	w.bufWriter.WriteString("\r\n")
 }
 
-func (w *responseWriter) finish() error {
-	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
+func serve(mux http.Handler, w *Response, req *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("handler panic: %v", rec)
+			if !w.wroteHeader {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			w.closeAfter = true
+		}
+	}()
+	mux.ServeHTTP(w, req)
+}
+
+func writeError(conn net.Conn, perr error) {
+	code := http.StatusBadRequest
+	var pe *protocolError
+	if errors.As(perr, &pe) {
+		code = pe.code
 	}
-	return w.bufWriter.Flush()
+	bw := bufio.NewWriter(conn)
+	fmt.Fprintf(bw, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+	fmt.Fprintf(bw, "Content-Length: 0\r\n")
+	fmt.Fprintf(bw, "Connection: close\r\n")
+	fmt.Fprintf(bw, "Date: %s\r\n\r\n", time.Now().UTC().Format(http.TimeFormat))
+	bw.Flush()
+}
+
+func drain(b io.ReadCloser) bool {
+	if b == nil || b == http.NoBody {
+		return true
+	}
+	n, _ := io.CopyN(io.Discard, b, maxDrainBytes+1)
+	b.Close()
+	return n <= maxDrainBytes
 }

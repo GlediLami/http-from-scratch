@@ -2,8 +2,6 @@ package http1
 
 import (
 	"bufio"
-	"bytes"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,353 +9,325 @@ import (
 	"strings"
 )
 
-// ParseRequest parses an HTTP/1.1 stream into an *http.Request.
-// It returns an *HTTPError containing RFC-compliant status codes (e.g. 400, 505) on failure.
-func ParseRequest(reader *bufio.Reader) (*http.Request, error) {
-	p := &requestParser{
-		reader: reader,
-		state:  stateRequestLine,
-		req: &http.Request{
-			Header: make(http.Header),
-		},
-	}
-	return p.parse()
-}
-
-// HTTPError attaches an RFC-compliant HTTP status code to parser failures.
-type HTTPError struct {
-	StatusCode int
-	Message    string
-}
-
-func (e *HTTPError) Error() string {
-	return fmt.Sprintf("http1: %d %s: %s", e.StatusCode, http.StatusText(e.StatusCode), e.Message)
-}
-
-func badRequest(msg string) error {
-	return &HTTPError{StatusCode: http.StatusBadRequest, Message: msg}
-}
-
-func versionNotSupported(msg string) error {
-	return &HTTPError{StatusCode: http.StatusHTTPVersionNotSupported, Message: msg}
-}
-
-func notImplemented(msg string) error {
-	return &HTTPError{StatusCode: http.StatusNotImplemented, Message: msg}
-}
-
-type parserState int
-
-const (
-	stateRequestLine parserState = iota
-	stateHeaders
-	stateBody
-	stateComplete
-)
-
-type requestParser struct {
-	reader *bufio.Reader
-	state  parserState
-	req    *http.Request
-}
-
-func (p *requestParser) parse() (*http.Request, error) {
-	for p.state != stateComplete {
-		switch p.state {
-		case stateRequestLine:
-			line, err := p.readLine()
-			if err != nil {
-				return nil, err
-			}
-			if len(line) == 0 {
-				continue // RFC 9112 §2.2: Ignore empty lines before request-line
-			}
-			if err := p.parseRequestLine(line); err != nil {
-				return nil, err
-			}
-			p.state = stateHeaders
-
-		case stateHeaders:
-			line, err := p.readLine()
-			if err != nil {
-				return nil, err
-			}
-			if len(line) == 0 {
-				p.state = stateBody
-				continue // RFC 9112 §2.1: Empty line terminates headers
-			}
-			if err := p.parseFieldLine(line); err != nil {
-				return nil, err
-			}
-
-		case stateBody:
-			if err := p.setupBodyReader(); err != nil {
-				return nil, err
-			}
-			p.state = stateComplete
-		}
-	}
-
-	return p.req, nil
-}
-
-func (p *requestParser) parseRequestLine(line []byte) error {
-	parts := bytes.Split(line, []byte(" "))
-	if len(parts) != 3 || len(parts[0]) == 0 || len(parts[1]) == 0 || len(parts[2]) == 0 {
-		return badRequest("malformed request-line")
-	}
-
-	method, target, version := parts[0], parts[1], parts[2]
-
-	if err := p.validateToken(method); err != nil {
-		return badRequest("invalid method token")
-	}
-	p.req.Method = string(method)
-
-	rawURL := string(target)
-	parsedURL, err := url.ParseRequestURI(rawURL)
+func ParseRequest(r *bufio.Reader) (*http.Request, error) {
+	line, err := readStartLine(r)
 	if err != nil {
-		return badRequest("invalid request-target URI")
+		return nil, err
 	}
-	p.req.URL = parsedURL
-	p.req.RequestURI = rawURL
+	method, target, proto, err := parseRequestLine(line)
 
-	major, minor, err := p.parseHTTPVersion(version)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	p.req.ProtoMajor = major
-	p.req.ProtoMinor = minor
-	p.req.Proto = string(version)
-
-	return nil
-}
-
-func (p *requestParser) parseFieldLine(line []byte) error {
-	if line[0] == ' ' || line[0] == '\t' {
-		return badRequest("obsolete line folding (obs-fold) is prohibited")
-	}
-
-	colonIdx := bytes.IndexByte(line, ':')
-	if colonIdx <= 0 {
-		return badRequest("malformed header line: missing colon")
-	}
-
-	fieldName := line[:colonIdx]
-	if fieldName[len(fieldName)-1] == ' ' || fieldName[len(fieldName)-1] == '\t' {
-		return badRequest("whitespace before colon is prohibited")
-	}
-
-	if err := p.validateToken(fieldName); err != nil {
-		return badRequest("invalid character in field-name")
-	}
-
-	fieldVal := bytes.Trim(line[colonIdx+1:], " \t")
-	for _, b := range fieldVal {
-		if (b < 0x20 && b != '\t') || b == 0x7F {
-			return badRequest("unprintable control characters in header value")
-		}
-	}
-
-	nameStr := string(fieldName)
-	valStr := string(fieldVal)
-
-	if strings.EqualFold(nameStr, "Host") {
-		p.req.Host = valStr
-	}
-
-	p.req.Header.Add(nameStr, valStr)
-	return nil
-}
-
-func (p *requestParser) setupBodyReader() error {
-	if p.req.ProtoMajor == 1 && p.req.ProtoMinor >= 1 {
-		if p.req.Host == "" || len(p.req.Header.Values("Host")) != 1 {
-			return badRequest("HTTP/1.1 requests require exactly one Host header")
-		}
-	}
-
-	teHeaders := p.req.Header.Values("Transfer-Encoding")
-	clHeaders := p.req.Header.Values("Content-Length")
-
-	if len(teHeaders) > 0 && len(clHeaders) > 0 {
-		return badRequest("request contains both Transfer-Encoding and Content-Length")
-	}
-
-	if len(teHeaders) > 0 {
-		combinedTE := strings.Join(teHeaders, ",")
-		codings := strings.Split(combinedTE, ",")
-		lastCoding := strings.ToLower(strings.TrimSpace(codings[len(codings)-1]))
-
-		if lastCoding != "chunked" {
-			return notImplemented(fmt.Sprintf("unsupported transfer coding: %s", lastCoding))
-		}
-
-		p.req.Body = &chunkedReader{r: p.reader}
-		p.req.ContentLength = -1
-		return nil
-	}
-
-	if len(clHeaders) > 0 {
-		var canonicalLength int64 = -1
-		for _, rawCL := range clHeaders {
-			for _, part := range strings.Split(rawCL, ",") {
-				cleanVal := strings.TrimSpace(part)
-				val, err := strconv.ParseInt(cleanVal, 10, 64)
-				if err != nil || val < 0 {
-					return badRequest("invalid Content-Length value")
-				}
-				if canonicalLength != -1 && canonicalLength != val {
-					return badRequest("conflicting Content-Length header values")
-				}
-				canonicalLength = val
-			}
-		}
-
-		p.req.ContentLength = canonicalLength
-		if canonicalLength == 0 {
-			p.req.Body = http.NoBody
-		} else {
-			p.req.Body = io.NopCloser(io.LimitReader(p.reader, canonicalLength))
-		}
-		return nil
-	}
-
-	p.req.Body = http.NoBody
-	p.req.ContentLength = 0
-	return nil
-}
-
-func (p *requestParser) parseHTTPVersion(v []byte) (int, int, error) {
-	if len(v) != 8 || !bytes.HasPrefix(v, []byte("HTTP/")) || v[6] != '.' {
-		return 0, 0, badRequest("malformed HTTP-version")
-	}
-
-	majorByte := v[5]
-	minorByte := v[7]
-
-	if majorByte < '0' || majorByte > '9' || minorByte < '0' || minorByte > '9' {
-		return 0, 0, badRequest("HTTP-version numbers must be single digits")
-	}
-
-	major := int(majorByte - '0')
-	minor := int(minorByte - '0')
-
-	if major != 1 {
-		return 0, 0, versionNotSupported(fmt.Sprintf("unsupported major HTTP version: %d", major))
-	}
-
-	return major, minor, nil
-}
-
-func (p *requestParser) validateToken(token []byte) error {
-	if len(token) == 0 {
-		return badRequest("empty token")
-	}
-	for _, b := range token {
-		if !p.isTChar(b) {
-			return badRequest(fmt.Sprintf("invalid character in token: 0x%02x", b))
-		}
-	}
-	return nil
-}
-
-func (p *requestParser) isTChar(b byte) bool {
-	return (b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9') ||
-		bytes.IndexByte([]byte("!#$%&'*+-.^_`|~"), b) != -1
-}
-
-func (p *requestParser) readLine() ([]byte, error) {
-	line, err := p.reader.ReadBytes('\n')
+	major, minor, err := parseVersion(proto)
 	if err != nil {
-		if err == io.EOF && len(line) == 0 {
-			return nil, io.EOF
-		}
-		if err == io.EOF {
-			return nil, badRequest("unexpected EOF before line completed")
-		}
 		return nil, err
 	}
 
-	if bytes.HasSuffix(line, []byte("\r\n")) {
-		line = line[:len(line)-2]
-	} else if bytes.HasSuffix(line, []byte("\n")) {
-		line = line[:len(line)-1]
+	header, err := readHeaders(r)
+	if err != nil {
+		return nil, err
 	}
-
-	if bytes.IndexByte(line, '\r') != -1 {
-		return nil, badRequest("bare CR character in input line is forbidden")
+	req := &http.Request{
+		Method:     method,
+		RequestURI: target,
+		Proto:      proto,
+		ProtoMajor: major,
+		ProtoMinor: minor,
+		Header:     header,
 	}
-
-	return line, nil
+	if err := setHost(req, target); err != nil {
+		return nil, err
+	}
+	if err := setURL(req, target); err != nil {
+		return nil, err
+	}
+	if err := setBody(req, r); err != nil {
+		return nil, err
+	}
+	req.Close = shouldClose(req)
+	return req, nil
 }
 
-type chunkedReader struct {
-	r         *bufio.Reader
-	remaining int64
-	done      bool
-}
+// reads one CRLF terminated line and returns it without the CRLF
+// a LF without a CR is rejected
+// ReadSlice('\n') hands back to internal buffer so we copy with string(...)
+// err buffer full gives us a free length limit
+func readLine(r *bufio.Reader, limit int) (string, error) {
+	var buf []byte
+	for {
 
-func (cr *chunkedReader) Read(p []byte) (int, error) {
-	if cr.done {
-		return 0, io.EOF
-	}
+		slice, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			buf = append(buf, slice...)
 
-	if cr.remaining == 0 {
-		line, err := cr.r.ReadBytes('\n')
-		if err != nil {
-			return 0, badRequest("malformed chunk header")
-		}
-
-		line = bytes.TrimRight(line, "\r\n")
-		if semi := bytes.IndexByte(line, ';'); semi != -1 {
-			line = line[:semi]
-		}
-		line = bytes.TrimSpace(line)
-
-		size, err := strconv.ParseInt(string(line), 16, 64)
-		if err != nil || size < 0 {
-			return 0, badRequest("invalid hexadecimal chunk size")
-		}
-
-		if size == 0 {
-			cr.done = true
-			for {
-				trailerLine, err := cr.r.ReadBytes('\n')
-				if err != nil {
-					return 0, badRequest("malformed chunk trailers")
-				}
-				if len(bytes.TrimRight(trailerLine, "\r\n")) == 0 {
-					break
-				}
+			if len(buf) > limit {
+				return "", protoErr(http.StatusRequestHeaderFieldsTooLarge, "line too long")
 			}
-			return 0, io.EOF
+
+			continue
 		}
 
-		cr.remaining = size
-	}
-
-	toRead := int64(len(p))
-	if toRead > cr.remaining {
-		toRead = cr.remaining
-	}
-
-	n, err := cr.r.Read(p[:toRead])
-	cr.remaining -= int64(n)
-
-	if cr.remaining == 0 {
-		crlf := make([]byte, 2)
-		if _, err := io.ReadFull(cr.r, crlf); err != nil || crlf[0] != '\r' || crlf[1] != '\n' {
-			return n, badRequest("missing CRLF after chunk data")
+		if err != nil {
+			if err == io.EOF && len(buf) == 0 && len(slice) == 0 {
+				return "", io.EOF
+			}
+			return "", err
 		}
+
+		buf = append(buf, slice...)
+		break
+
 	}
 
-	return n, err
+	if len(buf) > limit {
+		return "", protoErr(http.StatusRequestHeaderFieldsTooLarge, "line too long")
+	}
+
+	n := len(buf)
+
+	if n < 2 || buf[n-1] != '\n' || buf[n-2] != '\r' {
+		return "", protoErr(http.StatusBadRequest, "line not terminated by CRLF")
+	}
+
+	return string(buf[:n-2]), nil
 }
 
-func (cr *chunkedReader) Close() error {
-	cr.done = true
+// returns first non empty line
+func readStartLine(r *bufio.Reader) (string, error) {
+	for tries := 0; tries < 0; tries++ {
+		line, err := readLine(r, maxRequestLineBytes)
+		if err != nil {
+			return "", err
+		}
+		if line != "" {
+			return line, nil
+		}
+	}
+	return "", protoErr(http.StatusBadRequest, "too many blank lines before request")
+}
+
+// Grammar -> method SP request-target SP HTTP-version . 1 space between parts
+// 1st and last space and reject any space left inside
+// Get / with double space fails
+func parseRequestLine(line string) (method, target, proto string, err error) {
+	first := strings.IndexByte(line, ' ')
+	last := strings.LastIndexByte(line, ' ')
+
+	if first <= 0 || first == last {
+		return "", "", "", protoErr(http.StatusBadRequest, "malformed request line?")
+	}
+
+	method = line[:first]
+	target = line[first+1 : last]
+	proto = line[last+1:]
+	if strings.IndexByte(target, ' ') != -1 {
+		return "", "", "", protoErr(http.StatusBadRequest, "extra space in request line")
+	}
+	if !isToken(method) {
+		return "", "", "", protoErr(http.StatusBadRequest, "invalid method")
+	}
+
+	if target == "" {
+		return "", "", "", protoErr(http.StatusBadRequest, "empty request target")
+	}
+	return method, target, proto, nil
+}
+
+func parseVersion(proto string) (major, minor int, err error) {
+	const pfx = "HTTP/"
+	if len(proto) != len(pfx)+3 || proto[:len(pfx)] != pfx {
+		return 0, 0, protoErr(http.StatusBadRequest, "malformed HTTP version")
+	}
+	hi, dot, lo := proto[5], proto[6], proto[7]
+	if hi < '0' || hi > '9' || dot != '.' || lo < '0' || lo > '9' {
+		return 0, 0, protoErr(http.StatusBadRequest, "malformed HTTP version")
+	}
+	major, minor = int(hi-'0'), int(lo-'0')
+	if major != 1 {
+		return 0, 0, protoErr(http.StatusBadRequest, "unsupported HTTP version")
+	}
+	return major, minor, nil
+}
+
+func readHeaders(r *bufio.Reader) (http.Header, error) {
+	h := make(http.Header)
+	for n := 0; ; n++ {
+		line, err := readLine(r, maxHeaderLineBytes)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if line == "" {
+			return h, nil
+		}
+
+		if n >= maxHeaderLines {
+			return nil, protoErr(http.StatusRequestHeaderFieldsTooLarge, "too many header fields")
+		}
+
+		if line[0] == ' ' || line[0] == '\t' {
+			return nil, protoErr(http.StatusBadRequest, "obsolete line folding?")
+		}
+
+		colon := strings.IndexByte(line, ':')
+		if colon <= 0 {
+			return nil, protoErr(http.StatusBadRequest, "malformed header field")
+		}
+		name := line[:colon]
+		if !isToken(name) {
+			return nil, protoErr(http.StatusBadRequest, "invalid header name")
+		}
+		value := strings.Trim(line[colon+1:], " \t")
+		if !validFieldValue(value) {
+			return nil, protoErr(http.StatusBadRequest, "invalid header value")
+		}
+		h.Add(name, value)
+	}
+}
+
+func setHost(req *http.Request, target string) error {
+	hosts := req.Header["Host"]
+	if len(hosts) > 1 {
+		return protoErr(http.StatusBadRequest, "multiple Host Headers")
+	}
+	if req.ProtoMajor == 1 && req.ProtoMinor == 1 && len(hosts) != 1 {
+		return protoErr(http.StatusBadRequest, "missing Host Header")
+	}
+	if len(hosts) == 1 {
+		req.Host = hosts[0]
+	}
+
+	if strings.Contains(target, "://") {
+		if u, err := url.Parse(target); err == nil && u.Host != "" {
+			req.Host = u.Host
+		}
+	}
+	req.Header.Del("Host")
 	return nil
+}
+
+func setURL(req *http.Request, target string) error {
+	if target == "*" {
+		req.URL = &url.URL{Path: "*"}
+		return nil
+	}
+	u, err := url.ParseRequestURI(target)
+	if err != nil {
+		return protoErr(http.StatusBadRequest, "invalid request target")
+	}
+
+	req.URL = u
+	return nil
+}
+
+// Content-Length and Transfer-Encoding together is a 400
+// chunked must be the only coding
+// A Content-Length body is read with a bounded LimitReader
+// No framing headers means a request has no body
+func setBody(req *http.Request, r *bufio.Reader) error {
+	te := req.Header.Values("Transfer-Encoding")
+	cl := req.Header.Values("Content-Length")
+
+	if len(te) > 0 && len(cl) > 0 {
+		return protoErr(http.StatusBadRequest, "both Transfer-Encoding and Content-Length")
+	}
+
+	if len(te) > 0 {
+		if req.ProtoMajor == 1 && req.ProtoMinor == 0 {
+			return protoErr(http.StatusBadRequest, "Transfer-Encoding in HTTP/1.0 ?")
+		}
+
+		codings := splitList(te)
+		if len(codings) != 1 || codings[0] != "chunked" {
+			return protoErr(http.StatusBadRequest, "unsupported transfer coding")
+		}
+		req.TransferEncoding = []string{"chunked"}
+		req.ContentLength = -1
+		req.Header.Del("Transfer-Encoding")
+		req.Body = &body{src: newChunkedReader(r), expect: -1}
+		return nil
+	}
+
+	if len(cl) > 0 {
+		n, ok := parseContentLength(cl)
+		if !ok {
+			return protoErr(http.StatusBadRequest, "invalid Content-Length")
+		}
+		if n > maxBodyBytes {
+			return protoErr(http.StatusBadRequest, "body too large")
+		}
+		req.ContentLength = n
+		if n == 0 {
+			req.Body = http.NoBody
+			return nil
+		}
+		req.Body = &body{src: io.LimitReader(r, n), expect: n}
+		return nil
+	}
+
+	req.ContentLength = 0
+	req.Body = http.NoBody
+	return nil
+}
+
+func splitList(values []string) []string {
+	var out []string
+	for _, v := range values {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// Content-Length must be only digits
+// strconv.ParseInt alone accepts +5 and -5, so we check every byte first
+// Repeated identical values are fine; different values are an attack, reject them
+func parseContentLength(values []string) (int64, bool) {
+	var parts []string
+	for _, v := range values {
+		for _, p := range strings.Split(v, ",") {
+			parts = append(parts, strings.TrimSpace(p))
+		}
+	}
+	if len(parts) == 0 {
+		return 0, false
+	}
+	first := parts[0]
+	for _, p := range parts {
+		if p != first {
+			return 0, false
+		}
+	}
+	if first == "" {
+		return 0, false
+	}
+	for i := 0; i < len(first); i++ {
+		if first[i] < '0' || first[i] > '9' {
+			return 0, false
+		}
+	}
+
+	n, err := strconv.ParseInt(first, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// shouldClose reads the keep-alive rules: HTTP/1.1 stays open unless Connection: close;
+// HTTP/1.0 closes unless Connection: keep-alive.
+func shouldClose(req *http.Request) bool {
+	conn := map[string]bool{}
+	for _, tok := range splitList(req.Header.Values("Connection")) {
+		conn[tok] = true
+	}
+	if req.ProtoMajor == 1 && req.ProtoMinor == 1 {
+		return conn["close"]
+	}
+	return !conn["keep-alive"]
 }

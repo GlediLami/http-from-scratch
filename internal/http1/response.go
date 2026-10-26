@@ -2,97 +2,118 @@ package http1
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 )
 
-// Response implements http.ResponseWriter for serializing HTTP/1.1 wire responses.
 type Response struct {
 	conn        net.Conn
-	bufWriter   *bufio.Writer
+	bw          *bufio.Writer
+	req         *http.Request
 	header      http.Header
+	status      int
 	wroteHeader bool
-	statusCode  int
-	Proto       string
-	CloseConn   bool
+	buf         bytes.Buffer
+	closeAfter  bool // set by server loop
 }
 
-// NewResponse initializes a response wrapper around an active net.Conn socket.
+var _ http.ResponseWriter = (*Response)(nil)
+
 func NewResponse(conn net.Conn) *Response {
 	return &Response{
-		conn:       conn,
-		bufWriter:  bufio.NewWriter(conn),
-		header:     make(http.Header),
-		Proto:      "HTTP/1.1",
-		statusCode: http.StatusOK,
+		conn:   conn,
+		bw:     bufio.NewWriter(conn),
+		header: make(http.Header),
 	}
 }
 
-// Header returns the header map that will be sent by WriteHeader.
-func (r *Response) Header() http.Header {
-	return r.header
-}
+func (r *Response) Header() http.Header { return r.header }
 
-// WriteHeader sends an HTTP response header with the provided status code.
-func (r *Response) WriteHeader(statusCode int) {
+func (r *Response) WriteHeader(status int) {
 	if r.wroteHeader {
-		return
+		return // the first call wins
 	}
-	r.statusCode = statusCode
-	r.flushHeader()
+	if status < 100 || status > 999 {
+		status = http.StatusInternalServerError
+	}
+	r.status = status
+	r.wroteHeader = true
 }
 
-// Write writes the data to the connection as part of an HTTP reply.
-// If WriteHeader has not yet been called, Write calls WriteHeader(http.StatusOK).
-func (r *Response) Write(data []byte) (n int, err error) {
+func (r *Response) Write(p []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
-	return r.bufWriter.Write(data)
+	return r.buf.Write(p)
 }
 
-// flushHeader serializes the status-line and field lines to the buffered writer.
-func (r *Response) flushHeader() {
-	if r.wroteHeader {
-		return
+// finish serializes the response onto the connection.
+// status line, then headers, then a blank line, then the body
+// An origin server must send Date
+// 204 and 304 carry no body and no length headers
+func (r *Response) finish() error {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
 	}
-	r.wroteHeader = true
+	isHead := r.req.Method == http.MethodHead
+	bodyAllowed := bodyAllowedForStatus(r.status)
+	body := r.buf.Bytes()
 
-	if r.statusCode == 0 {
-		r.statusCode = http.StatusOK
+	fmt.Fprintf(r.bw, "HTTP/1.1 %d %s\r\n", r.status, http.StatusText(r.status))
+
+	if r.header.Get("Date") == "" {
+		r.header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
 	}
-	if r.Proto == "" {
-		r.Proto = "HTTP/1.1"
+	if bodyAllowed {
+		r.header.Set("Content-Length", strconv.Itoa(len(body)))
+	} else {
+		r.header.Del("Content-Length")
+		r.header.Del("Transfer-Encoding")
 	}
-
-	statusText := http.StatusText(r.statusCode)
-	if statusText == "" {
-		statusText = "status code " + strconv.Itoa(r.statusCode)
-	}
-
-	// RFC 9112 §3.1: status-line = HTTP-version SP status-code SP [reason-phrase] CRLF
-	fmt.Fprintf(r.bufWriter, "%s %d %s\r\n", r.Proto, r.statusCode, statusText)
-
-	if r.CloseConn {
+	if r.closeAfter {
 		r.header.Set("Connection", "close")
 	}
-
-	// RFC 9112 §5: field-line = field-name ":" OWS field-value OWS CRLF
-	for key, values := range r.header {
-		for _, value := range values {
-			fmt.Fprintf(r.bufWriter, "%s: %s\r\n", key, value)
+	if err := writeHeaders(r.bw, r.header); err != nil {
+		return err
+	}
+	if _, err := r.bw.WriteString("\r\n"); err != nil {
+		return err
+	}
+	if bodyAllowed && !isHead {
+		if _, err := r.bw.Write(body); err != nil {
+			return err
 		}
 	}
-	r.bufWriter.WriteString("\r\n")
+	return r.bw.Flush()
 }
 
-// Finish flushes any buffered data directly to the underlying TCP connection.
-// It is called by the server loop when the handler completes execution.
-func (r *Response) Finish() error {
-	if !r.wroteHeader {
-		r.WriteHeader(http.StatusOK)
+func writeHeaders(bw *bufio.Writer, h http.Header) error {
+	for name, values := range h {
+		if !isToken(name) {
+			continue
+		}
+		for _, v := range values {
+			if !validFieldValue(v) { // block header injection
+				continue
+			}
+			if _, err := fmt.Fprintf(bw, "%s: %s\r\n", name, v); err != nil {
+				return err
+			}
+		}
 	}
-	return r.bufWriter.Flush()
+	return nil
+}
+
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status < 200:
+		return false
+	case status == http.StatusNoContent, status == http.StatusNotModified:
+		return false
+	}
+	return true
 }
