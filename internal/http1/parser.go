@@ -95,7 +95,7 @@ func readLine(r *bufio.Reader, limit int) (string, error) {
 
 // returns first non empty line
 func readStartLine(r *bufio.Reader) (string, error) {
-	for tries := 0; tries < 0; tries++ {
+	for tries := 0; tries < 8; tries++ {
 		line, err := readLine(r, maxRequestLineBytes)
 		if err != nil {
 			return "", err
