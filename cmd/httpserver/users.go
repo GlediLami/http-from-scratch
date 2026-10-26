@@ -25,8 +25,6 @@ func newUserStore() *userStore {
 	return &userStore{users: make(map[int]User), nextID: 1}
 }
 
-// file: cmd/httpserver/users.go
-
 func (s *userStore) list(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	out := make([]User, 0, len(s.users))
