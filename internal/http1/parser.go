@@ -2,6 +2,7 @@ package http1
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
@@ -46,6 +47,9 @@ func ParseRequest(r *bufio.Reader) (*http.Request, error) {
 		return nil, err
 	}
 	if err := setBody(req, r); err != nil {
+		return nil, err
+	}
+	if err := bufferBody(req); err != nil {
 		return nil, err
 	}
 	req.Close = shouldClose(req)
@@ -263,7 +267,7 @@ func setBody(req *http.Request, r *bufio.Reader) error {
 	cl := req.Header.Values("Content-Length")
 
 	if len(te) > 0 && len(cl) > 0 {
-		return protoErr(http.StatusBadRequest, "both Transfer-Encoding and Content-Length")
+		req.Header.Del("Content-Length")
 	}
 
 	if len(te) > 0 {
@@ -362,4 +366,23 @@ func shouldClose(req *http.Request) bool {
 		return conn["close"]
 	}
 	return !conn["keep-alive"]
+}
+
+func bufferBody(req *http.Request) error {
+	if req.Body == nil || req.Body == http.NoBody {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Body, maxBodyBytes+1))
+	if err != nil {
+		var pe *protocolError
+		if errors.As(err, &pe) {
+			return err
+		}
+		return protoErr(http.StatusBadRequest, "incomplete body")
+	}
+	if int64(len(data)) > maxBodyBytes {
+		return protoErr(http.StatusRequestEntityTooLarge, "body too large")
+	}
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	return nil
 }
