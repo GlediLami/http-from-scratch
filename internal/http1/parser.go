@@ -2,12 +2,15 @@ package http1
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 )
+
+var errLineTooLong = errors.New("line too long")
 
 func ParseRequest(r *bufio.Reader) (*http.Request, error) {
 	line, err := readStartLine(r)
@@ -62,7 +65,7 @@ func readLine(r *bufio.Reader, limit int) (string, error) {
 			buf = append(buf, slice...)
 
 			if len(buf) > limit {
-				return "", protoErr(http.StatusRequestHeaderFieldsTooLarge, "line too long")
+				return "", errLineTooLong
 			}
 
 			continue
@@ -71,6 +74,9 @@ func readLine(r *bufio.Reader, limit int) (string, error) {
 		if err != nil {
 			if err == io.EOF && len(buf) == 0 && len(slice) == 0 {
 				return "", io.EOF
+			}
+			if err == io.EOF {
+				return "", protoErr(http.StatusBadRequest, "line truncated by EOF")
 			}
 			return "", err
 		}
@@ -81,7 +87,7 @@ func readLine(r *bufio.Reader, limit int) (string, error) {
 	}
 
 	if len(buf) > limit {
-		return "", protoErr(http.StatusRequestHeaderFieldsTooLarge, "line too long")
+		return "", errLineTooLong
 	}
 
 	n := len(buf)
@@ -95,8 +101,11 @@ func readLine(r *bufio.Reader, limit int) (string, error) {
 
 // returns first non empty line
 func readStartLine(r *bufio.Reader) (string, error) {
-	for tries := 0; tries < 8; tries++ {
+	for tries := 0; tries < 2; tries++ {
 		line, err := readLine(r, maxRequestLineBytes)
+		if errors.Is(err, errLineTooLong) {
+			return "", protoErr(http.StatusRequestURITooLong, "request line too long ")
+		}
 		if err != nil {
 			return "", err
 		}
@@ -135,26 +144,49 @@ func parseRequestLine(line string) (method, target, proto string, err error) {
 }
 
 func parseVersion(proto string) (major, minor int, err error) {
-	const pfx = "HTTP/"
-	if len(proto) != len(pfx)+3 || proto[:len(pfx)] != pfx {
+
+	rest, ok := strings.CutPrefix(proto, "HTTP/")
+
+	if !ok {
 		return 0, 0, protoErr(http.StatusBadRequest, "malformed HTTP version")
 	}
-	hi, dot, lo := proto[5], proto[6], proto[7]
-	if hi < '0' || hi > '9' || dot != '.' || lo < '0' || lo > '9' {
+
+	hi, lo, ok := strings.Cut(rest, ".")
+
+	if !ok || !isDigits(hi) || !isDigits(lo) {
 		return 0, 0, protoErr(http.StatusBadRequest, "malformed HTTP version")
 	}
-	major, minor = int(hi-'0'), int(lo-'0')
-	if major != 1 {
-		return 0, 0, protoErr(http.StatusBadRequest, "unsupported HTTP version")
+
+	if hi != "1" || (lo != "0" && lo != "1") {
+		return 0, 0, protoErr(http.StatusHTTPVersionNotSupported, "unsupported http version")
 	}
-	return major, minor, nil
+
+	return 1, int(lo[0] - '0'), nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func readHeaders(r *bufio.Reader) (http.Header, error) {
 	h := make(http.Header)
 	for n := 0; ; n++ {
 		line, err := readLine(r, maxHeaderLineBytes)
-
+		if err == io.EOF {
+			return nil, protoErr(http.StatusBadRequest, "bad request")
+		}
+		if errors.Is(err, errLineTooLong) {
+			return nil, protoErr(http.StatusRequestHeaderFieldsTooLarge, "header line too long")
+		}
 		if err != nil {
 			return nil, err
 		}
