@@ -11,23 +11,23 @@ import (
 const addr = ":8080"
 
 func main() {
-	mux := http.NewServeMux()
+	r := http1.NewRouter()
 
-	mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hello\n"))
 	})
-	mux.HandleFunc("GET /get", handleGet)
-	mux.HandleFunc("POST /post", handlePost)
+	r.HandleFunc("GET /get", handleGet)
+	r.HandleFunc("POST /post", handlePost)
 
 	store := newUserStore()
-	mux.HandleFunc("GET /users", store.list)
-	mux.HandleFunc("POST /users", store.create)
-	mux.HandleFunc("GET /users/{id}", store.get)
-	mux.HandleFunc("PUT /users/{id}", store.update)
-	mux.HandleFunc("DELETE /users/{id}", store.remove)
+	r.HandleFunc("GET /users", store.list)
+	r.HandleFunc("POST /users", store.create)
+	r.HandleFunc("GET /users/{id}", store.get)
+	r.HandleFunc("PUT /users/{id}", store.update)
+	r.HandleFunc("DELETE /users/{id}", store.remove)
 
 	log.Printf("listening on %s", addr)
-	if err := http1.ListenAndServe(addr, mux); err != nil {
+	if err := http1.ListenAndServe(addr, r); err != nil {
 		log.Fatal(err)
 	}
 }

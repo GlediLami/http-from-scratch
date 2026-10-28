@@ -2,6 +2,7 @@ package http1
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -54,8 +55,8 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 
 	if c.remaining == 0 {
 		if err := c.expectCRLF(); err != nil {
-			c.err = err
-			return n, err
+			c.err = c.fail(err)
+			return n, c.err
 		}
 	}
 	return n, nil
@@ -73,7 +74,7 @@ func (c *chunkedReader) beginChunk() error {
 	}
 	line = strings.TrimSpace(line)
 	size, err := strconv.ParseInt(line, 16, 64)
-	if err != nil || size == 0 || size > maxChunkSize {
+	if err != nil || size < 0 || size > maxChunkSize {
 		return protoErr(http.StatusBadRequest, "invalid chunk size")
 	}
 	if size == 0 {
@@ -104,4 +105,11 @@ func (c *chunkedReader) expectCRLF() error {
 		return protoErr(http.StatusBadRequest, "missing CRLF after chunk data")
 	}
 	return nil
+}
+
+func (c *chunkedReader) fail(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return protoErr(http.StatusBadRequest, "chunked body truncated")
+	}
+	return err
 }
