@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,21 +87,21 @@ func (m *metrics) middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (m *metrics) observe(method, path string, status int, d time.Duration) {
+func (m *metrics) observe(method, route string, status int, d time.Duration) {
 	m.mu.Lock()
 
 	defer m.mu.Unlock()
 
-	m.reqs[method+"|"+path+"|"+strconv.Itoa(status)]++
+	m.reqs[method+"|"+route+"|"+strconv.Itoa(status)]++
 
 	sec := d.Seconds()
-	m.durCount[path]++
-	m.durSum[path] += sec
-	bkt := m.durBkt[path]
+	m.durCount[route]++
+	m.durSum[route] += sec
+	bkt := m.durBkt[route]
 
 	if bkt == nil {
 		bkt = make([]uint64, len(histBuckets))
-		m.durBkt[path] = bkt
+		m.durBkt[route] = bkt
 	}
 	for i, b := range histBuckets {
 		if sec <= b {
@@ -127,7 +128,7 @@ func (m *metrics) handler(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(keys) // stable output is easier to eyeball and diff
 	for _, k := range keys {
 		p := strings.SplitN(k, "|", 3)
-		fmt.Fprintf(w, "http_requests_total{method=%q,path=%q,status=%q} %d\n",
+		fmt.Fprintf(w, "http_requests_total{method=%q,route=%q,status=%q} %d\n",
 			p[0], p[1], p[2], m.reqs[k])
 	}
 
@@ -144,15 +145,24 @@ func (m *metrics) handler(w http.ResponseWriter, r *http.Request) {
 		var cum uint64
 		for i, b := range histBuckets {
 			cum += m.durBkt[p][i] // histogram buckets are cumulative on the wire
-			fmt.Fprintf(w, "http_request_duration_seconds_bucket{path=%q,le=%q} %d\n",
+			fmt.Fprintf(w, "http_request_duration_seconds_bucket{route=%q,le=%q} %d\n",
 				p, strconv.FormatFloat(b, 'g', -1, 64), cum)
 		}
-		fmt.Fprintf(w, "http_request_duration_seconds_bucket{path=%q,le=\"+Inf\"} %d\n", p, m.durCount[p])
-		fmt.Fprintf(w, "http_request_duration_seconds_sum{path=%q} %g\n", p, m.durSum[p])
-		fmt.Fprintf(w, "http_request_duration_seconds_count{path=%q} %d\n", p, m.durCount[p])
+		fmt.Fprintf(w, "http_request_duration_seconds_bucket{route=%q,le=\"+Inf\"} %d\n", p, m.durCount[p])
+		fmt.Fprintf(w, "http_request_duration_seconds_sum{route=%q} %g\n", p, m.durSum[p])
+		fmt.Fprintf(w, "http_request_duration_seconds_count{route=%q} %d\n", p, m.durCount[p])
 	}
 
 	fmt.Fprintln(w, "# HELP http_in_flight_requests Requests currently being served.")
 	fmt.Fprintln(w, "# TYPE http_in_flight_requests gauge")
 	fmt.Fprintf(w, "http_in_flight_requests %d\n", atomic.LoadInt64(&m.inflight))
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintln(w, "# HELP go_goroutines Number of goroutines that currently exist.")
+	fmt.Fprintln(w, "# TYPE go_goroutines gauge")
+	fmt.Fprintf(w, "go_goroutines %d\n", runtime.NumGoroutine())
+	fmt.Fprintln(w, "# HELP go_memstats_heap_inuse_bytes Heap memory in use.")
+	fmt.Fprintln(w, "# TYPE go_memstats_heap_inuse_bytes gauge")
+	fmt.Fprintf(w, "go_memstats_heap_inuse_bytes %d\n", ms.HeapInuse)
 }
