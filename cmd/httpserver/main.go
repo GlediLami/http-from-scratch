@@ -11,6 +11,7 @@ import (
 const addr = ":8080"
 
 func main() {
+	m := newMetrics()
 	r := http1.NewRouter()
 
 	r.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
@@ -26,8 +27,15 @@ func main() {
 	r.HandleFunc("PUT /users/{id}", store.update)
 	r.HandleFunc("DELETE /users/{id}", store.remove)
 
+	r.HandleFunc("GET /metrics", m.handler)
+	r.HandleFunc("GET /healthz", func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := m.middleware(r)
+
 	log.Printf("listening on %s", addr)
-	if err := http1.ListenAndServe(addr, r); err != nil {
+	if err := http1.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }
