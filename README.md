@@ -43,3 +43,13 @@ Content-Length: 235
 
 Until this point, it is fine to use the http.DefaultServeMux.
 
+
+
+## To run Victoria Metrics
+docker run --rm -p 8428:8428 \
+  -v "$PWD/vmscrape.yml:/etc/vm/scrape.yml" \
+  victoriametrics/victoria-metrics \
+  -promscrape.config=/etc/vm/scrape.yml
+
+
+curl -s 'http://localhost:8428/api/v1/query?query=http_requests_total' | jq .
