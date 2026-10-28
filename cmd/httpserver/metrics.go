@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ http_request_duration_seconds — a histogram, so you can compute p95/p99 latenc
 http_in_flight_requests — a gauge. "How many requests are being served right now."
 */
 type metrics struct {
+	log      *slog.Logger
 	mu       sync.Mutex
 	reqs     map[string]uint64   // "method|path|status" -> count
 	durCount map[string]uint64   // path -> number of observations
@@ -33,6 +35,7 @@ type metrics struct {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	bytes  int
 }
 
 func (s *statusRecorder) WriteHeader(c int) {
@@ -40,9 +43,16 @@ func (s *statusRecorder) WriteHeader(c int) {
 	s.ResponseWriter.WriteHeader(c)
 }
 
+func (s *statusRecorder) Write(p []byte) (int, error) { // NEW
+	n, err := s.ResponseWriter.Write(p)
+	s.bytes += n
+	return n, err
+}
+
 // base constructor
-func newMetrics() *metrics {
+func newMetrics(log *slog.Logger) *metrics {
 	return &metrics{
+		log:      log,
 		reqs:     map[string]uint64{},
 		durCount: map[string]uint64{},
 		durSum:   map[string]float64{},
@@ -55,24 +65,24 @@ func (m *metrics) middleware(next http.Handler) http.Handler {
 		atomic.AddInt64(&m.inflight, 1)
 		defer atomic.AddInt64(&m.inflight, -1)
 
-		rec := &statusRecorder{
-			ResponseWriter: w,
-			status:         http.StatusOK,
-		}
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
+		d := time.Since(start)
 
-		path := r.Pattern // e.g. "GET /users/{id}"
-
-		if i := strings.IndexByte(path, ' '); i >= 0 {
-			path = path[i+1:] // keep just "/users/{id}"
+		route := r.Pattern // "GET /users/{id}"
+		if i := strings.IndexByte(route, ' '); i >= 0 {
+			route = route[i+1:] // "/users/{id}"
+		}
+		if route == "" {
+			route = "other" // 404 / 405 matched no pattern
 		}
 
-		if path == "" {
-			path = "other" // 404 / 405
-		}
-
-		m.observe(r.Method, path, rec.status, time.Since(start))
+		m.log.Info("request",
+			"method", r.Method, "route", route, "path", r.URL.Path,
+			"status", rec.status, "bytes", rec.bytes, "duration_ms", d.Milliseconds(),
+		)
+		m.observe(r.Method, route, rec.status, d) // you already had this call
 	})
 }
 

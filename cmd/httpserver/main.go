@@ -9,19 +9,19 @@ import (
 	"httpServer/internal/http1"
 )
 
-const addr = ":8080"
+var addr string
 
 func main() {
 
 	env := NewEnv()
-	m := newMetrics()
 	r := http1.NewRouter()
-
 	port := env.Port
-
+	addr = ":" + port
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	m := newMetrics(log)
 
 	log.Info("listening", "port", port)
 
