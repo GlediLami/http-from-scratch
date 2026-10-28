@@ -2,8 +2,9 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"httpServer/internal/http1"
 )
@@ -11,8 +12,18 @@ import (
 const addr = ":8080"
 
 func main() {
+
+	env := NewEnv()
 	m := newMetrics()
 	r := http1.NewRouter()
+
+	port := env.Port
+
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	log.Info("listening", "port", port)
 
 	r.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hello\n"))
@@ -34,8 +45,8 @@ func main() {
 
 	handler := m.middleware(r)
 
-	log.Printf("listening on %s", addr)
+	log.Info("listening on %s", "addr", addr)
 	if err := http1.ListenAndServe(addr, handler); err != nil {
-		log.Fatal(err)
+		log.Error("Error while listening", "err", err)
 	}
 }
