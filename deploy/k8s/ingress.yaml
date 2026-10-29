@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: httpserver
+spec:
+  ingressClassName: nginx
+  rules:
+    # no host: matches any Host header, so http://localhost/ works
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: httpserver
+                port:
+                  name: http

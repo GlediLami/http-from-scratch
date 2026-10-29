@@ -1,0 +1,16 @@
+# Tells the VictoriaMetrics operator's vmagent to scrape our Service.
+# The operator (installed by the victoria-metrics-k8s-stack chart) provides this CRD.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: httpserver
+  labels:
+    app: httpserver
+spec:
+  selector:
+    matchLabels:
+      app: httpserver        # picks the Service with this label
+  endpoints:
+    - port: http             # the Service port NAME, not a number
+      path: /metrics
+      interval: 15s

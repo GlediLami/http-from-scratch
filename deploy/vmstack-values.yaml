@@ -1,0 +1,27 @@
+# Slim values for victoria-metrics-k8s-stack on a laptop kind cluster.
+# Keeps the operator + vmsingle (storage) + vmagent (scraper). Turns off the
+# heavy cluster-monitoring extras you do not need to scrape your own app.
+
+# vmagent must discover our VMServiceScrape without us labelling everything.
+vmagent:
+  spec:
+    selectAllByDefault: true
+
+vmsingle:
+  spec:
+    retentionPeriod: "1d"
+
+# keep it light: drop the full kube-monitoring bundle for this lab
+grafana:
+  enabled: false
+defaultDashboardsEnabled: false
+defaultRules:
+  create: false
+alertmanager:
+  enabled: false
+vmalert:
+  enabled: false
+kube-state-metrics:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
