@@ -53,3 +53,30 @@ docker run --rm -p 8428:8428 \
 
 
 curl -s 'http://localhost:8428/api/v1/query?query=http_requests_total' | jq .
+
+
+## How to run observability stack with k8s
+
+```bash
+
+# 1. build the image
+make image
+docker images httpserver:dev            # expect: httpserver:dev  ~18MB
+
+# 2. deploy the server (creates cluster + ingress on first run)
+make deploy-local
+kubectl get pods                         # expect: 2x httpserver pods  Running
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost/healthz   # expect: 200
+
+# 3. install the metrics stack
+make vmstack
+kubectl -n monitoring get pods           # expect: operator, vmsingle, vmagent  Running
+
+# 4. turn on the scrape
+make scrape
+kubectl get vmservicescrape              # expect: httpserver
+
+make clean        # deletes the kind cluster and everything in it
+kind get clusters # expect: No kind clusters found.
+
+```
