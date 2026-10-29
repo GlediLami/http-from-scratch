@@ -1,5 +1,7 @@
-IMAGE     ?= httpserver:dev
-CLUSTER   ?= http-lab
+# $(or ...) keeps the default even if IMAGE/CLUSTER is exported but EMPTY in the
+# shell (plain ?= would keep the empty value and break `docker build -t  .`).
+IMAGE     := $(or $(IMAGE),httpserver:dev)
+CLUSTER   := $(or $(CLUSTER),http-lab)
 INGRESS_MANIFEST ?= https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml
 
 .PHONY: image cluster ingress deploy-local vmstack scrape up logs clean
