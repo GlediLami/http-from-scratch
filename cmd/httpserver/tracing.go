@@ -10,6 +10,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
+// tracer is the service-wide tracer; handlers can start child spans from it.
+var tracer = otel.Tracer("httpserver")
+
 func setupTracing(ctx context.Context) (shutdown func(context.Context) error, err error) {
 	// Endpoint comes from OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://localhost:4318
 	exp, err := otlptracehttp.New(ctx)

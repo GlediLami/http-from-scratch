@@ -11,6 +11,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var histBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
@@ -63,6 +69,15 @@ func newMetrics(log *slog.Logger) *metrics {
 
 func (m *metrics) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// continue an incoming trace (traceparent header) or start a new one
+		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(ctx, r.Method, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		r = r.WithContext(ctx)
+
+		// hand the trace id to the client before the handler writes (headers freeze after)
+		w.Header().Set("X-Trace-Id", span.SpanContext().TraceID().String())
+
 		atomic.AddInt64(&m.inflight, 1)
 		defer atomic.AddInt64(&m.inflight, -1)
 
@@ -79,11 +94,25 @@ func (m *metrics) middleware(next http.Handler) http.Handler {
 			route = "other" // 404 / 405 matched no pattern
 		}
 
-		m.log.Info("request",
+		// name the span and attach the standard HTTP semantic-convention attributes
+		if r.Pattern != "" {
+			span.SetName(r.Pattern)
+		}
+		span.SetAttributes(
+			attribute.String("http.request.method", r.Method),
+			attribute.String("http.route", route),
+			attribute.Int("http.response.status_code", rec.status),
+		)
+		if rec.status >= 500 { // a 404 is the client's fault, not a server error
+			span.SetStatus(codes.Error, http.StatusText(rec.status))
+		}
+
+		m.log.InfoContext(ctx, "request",
 			"method", r.Method, "route", route, "path", r.URL.Path,
 			"status", rec.status, "bytes", rec.bytes, "duration_ms", d.Milliseconds(),
+			"trace_id", span.SpanContext().TraceID().String(),
 		)
-		m.observe(r.Method, route, rec.status, d) // you already had this call
+		m.observe(r.Method, route, rec.status, d)
 	})
 }
 

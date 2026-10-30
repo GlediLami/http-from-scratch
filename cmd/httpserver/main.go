@@ -2,9 +2,13 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"httpServer/internal/http1"
 )
@@ -12,6 +16,9 @@ import (
 var addr string
 
 func main() {
+	// stop on Ctrl+C / SIGTERM so the span batch flushes before exit
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	env := NewEnv()
 	r := http1.NewRouter()
@@ -21,9 +28,14 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	m := newMetrics(log)
+	// tracing: exports spans over OTLP, configured via OTEL_* env vars.
+	// A failure here is not fatal: the server still serves, just without traces.
+	shutdownTracing, err := setupTracing(ctx)
+	if err != nil {
+		log.Error("tracing setup failed", "err", err)
+	}
 
-	log.Info("listening", "port", port)
+	m := newMetrics(log)
 
 	r.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hello\n"))
@@ -45,8 +57,21 @@ func main() {
 
 	handler := m.middleware(r)
 
-	log.Info("listening on %s", "addr", addr)
-	if err := http1.ListenAndServe(addr, handler); err != nil {
-		log.Error("Error while listening", "err", err)
+	go func() {
+		log.Info("listening", "addr", addr)
+		if err := http1.ListenAndServe(addr, handler); err != nil {
+			log.Error("listen", "err", err)
+			stop() // unblock main so we exit
+		}
+	}()
+
+	<-ctx.Done()
+	log.Info("shutting down")
+	if shutdownTracing != nil {
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shCtx); err != nil {
+			log.Error("tracing shutdown", "err", err)
+		}
 	}
 }
